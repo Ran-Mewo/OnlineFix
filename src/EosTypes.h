@@ -2,18 +2,11 @@
 
 #include <cstdint>
 
-// ─────────────────────────────────────────────────────────────────
-//  Partial mirrors of the EOS SDK structs we touch. Each one declares the
-//  struct's leading fields only as far as the last field we read or write,
-//  and omits the rest.
-//
-//  This is safe because the EOS ABI is append-only: new fields are only ever
-//  added at the end and bump the struct's ApiVersion, so existing field offsets
-//  never move and a leading slice stays correct on every later SDK. To stay
-//  version-agnostic we also never invent an ApiVersion: options coming from the
-//  game keep whatever version the game passed, and the one struct we construct
-//  ourselves (CreateDeviceId) uses its own *_API_LATEST.
-// ─────────────────────────────────────────────────────────────────
+// Partial mirrors of the EOS SDK structs we touch, declared only up to the
+// last field we read or write. Safe because the EOS ABI is append-only: field
+// offsets never move across SDK versions. We never invent an ApiVersion either
+// — options from the game keep theirs; the one struct we build (CreateDeviceId)
+// uses its own *_API_LATEST.
 
 using EOS_EResult = int32_t;
 using EOS_Bool    = int32_t;
@@ -61,8 +54,6 @@ struct EOS_Connect_CreateDeviceIdCallbackInfo {
     void*       ClientData;
 };
 
-// Declared only up to bPresenceEnabled; the original pointer is passed through
-// which ensures the omitted trailing fields we didn't touch stay intact.
 struct EOS_Lobby_CreateLobbyOptions_Partial {
     int32_t           ApiVersion;
     EOS_ProductUserId LocalUserId;

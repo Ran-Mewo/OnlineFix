@@ -5,8 +5,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Static runtime so the shipped DLL has no extra runtime dependencies.
-# MSVC: /MT via CMAKE_MSVC_RUNTIME_LIBRARY. MinGW: -static-libgcc/-libstdc++
-# applied as link options on the OnlineFix target below.
 if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
@@ -39,7 +37,6 @@ set_target_properties(detours PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
     target_compile_options(detours PRIVATE /w)
 else()
-    # MinGW / other GCC-like fronts: silence Detours' upstream noise.
     target_compile_options(detours PRIVATE -w)
 endif()
 
@@ -51,16 +48,11 @@ add_library(OnlineFix SHARED
 )
 set_target_properties(OnlineFix PROPERTIES PREFIX "" OUTPUT_NAME "OnlineFix")
 target_include_directories(OnlineFix PRIVATE src)
-# psapi: EnumProcessModules/GetModuleBaseNameW. advapi32: registry access
-# for the payload-log Steam-path lookup. MSVC links advapi32 automatically;
-# MinGW needs it spelled out.
+# advapi32 (registry) is implicit under MSVC but must be explicit for MinGW.
 target_link_libraries(OnlineFix PRIVATE detours psapi advapi32)
 
 if(MINGW)
-    # GetProcAddress reinterpret_casts trip -Wcast-function-type under GCC;
-    # the pattern is intentional and harmless.
-    target_compile_options(OnlineFix PRIVATE -Wno-cast-function-type)
-    # Match the MSVC /MT outcome: no extra runtime DLL deps at load time.
+    target_compile_options(OnlineFix PRIVATE -Wno-cast-function-type)  # GetProcAddress casts
     target_link_options(OnlineFix PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 

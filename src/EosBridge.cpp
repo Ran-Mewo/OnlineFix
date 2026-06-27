@@ -1,20 +1,9 @@
 // ─────────────────────────────────────────────────────────────────
-//  Not every game sold on Steam runs its multiplayer through Steam. Some
-//  ship a third-party online layer. Most such games use EOS which loads
-//  inside the game process and talks to its own servers; Steam is only
-//  the launcher. The Steam AppId 480 trick doesn't work since it never sees that traffic,
-//  so the only way we can make these games work is in-process, i.e. right next to the SDK.
-//  That's what this DLL is for.
-//
-//  Regular EOS works like this: the game logs into EOS with a Steam session ticket
-//  (credential type 18). The server validates that ticket against a genuine
-//  Steam license for the app, and so it fails the moment ownership isn't
-//  real. We try to sidestep ownership entirely by redirecting the Connect login
-//  to an anonymous Device ID auth, which carries no account or entitlement check.
-//  The display name is still read from Steam so friends see a real name.
-//
-//  Device ID auth has no Epic presence behind it, so the lobby hooks
-//  below drop the presence requirement that would otherwise reject us.
+//  EOS games run multiplayer through Epic's servers in-process, so the Steam
+//  AppId 480 trick can't reach them. This DLL hooks the EOS SDK directly:
+//  redirect the Connect login from a Steam session ticket (which fails without
+//  a real license) to anonymous Device ID auth, and drop the Epic-presence
+//  requirement on lobbies. The display name is still read from Steam.
 // ─────────────────────────────────────────────────────────────────
 
 #include "EosBridge.h"
@@ -22,7 +11,6 @@
 #include "PayloadLog.h"
 
 #include <atomic>
-#include <cstdio>
 #include <cstring>
 #include <detours.h>
 
@@ -36,10 +24,8 @@ namespace {
     EOS_Lobby_OpFn_t             oJoinLobby      = nullptr;
     EOS_Lobby_OpFn_t             oJoinLobbyById  = nullptr;
 
-    // Spans Connect_Login -> CreateDeviceId -> Login. Freed in the final
-    // Login callback (success) or the device-id callback (failure path).
-    // We carry the game's own ApiVersions through so the re-login matches the
-    // SDK the game was built against — never hardcode them.
+    // Carries the game's own ApiVersions across the Connect_Login ->
+    // CreateDeviceId -> Login chain. Freed in the final callback.
     struct LoginCtx {
         EOS_HConnect            handle;
         EOS_Connect_OnLoginCb   cb;
@@ -51,13 +37,30 @@ namespace {
         std::string             displayName;
     };
 
-    // EOS Device ID login requires a display name. Steam is already loaded
-    // in the game process by the time EOS comes up, so walk steam_api.
-    //
-    // Two interface-acquisition paths because not every Steamworks SDK
-    // release ships the legacy `SteamFriends()` flat accessor — newer SDKs
-    // only expose the `SteamAPI_ISteamFriends_*` per-method helpers and the
-    // `SteamInternal_FindOrCreateUserInterface` factory.
+    // Locate the versioned ISteamFriends accessor the SDK ships
+    // (SteamAPI_SteamFriends_v017, _v018, ...) without guessing the number.
+    FARPROC FindExportByPrefix(HMODULE mod, const char* prefix) {
+        auto base = reinterpret_cast<const BYTE*>(mod);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (!dir.VirtualAddress) return nullptr;
+
+        const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+        const auto* names   = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+        const auto* ordinals= reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+        const auto* funcs   = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
+        const size_t prefixLen = std::strlen(prefix);
+
+        for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+            const char* name = reinterpret_cast<const char*>(base + names[i]);
+            if (std::strncmp(name, prefix, prefixLen) == 0)
+                return reinterpret_cast<FARPROC>(const_cast<BYTE*>(base + funcs[ordinals[i]]));
+        }
+        return nullptr;
+    }
+
+    // EOS Device ID login needs a display name; use the Steam persona name.
     std::string SteamPersonaName() {
         HMODULE sa = GetModuleHandleW(L"steam_api64.dll");
         if (!sa) sa = GetModuleHandleW(L"steam_api.dll");
@@ -73,64 +76,23 @@ namespace {
             return "Unknown Player";
         }
 
+        // Prefer the legacy flat accessor; newer SDKs only ship the versioned one.
         void* friends = nullptr;
-        std::string via = "(none)";
-
-        // Path 1: legacy flat accessor — present in older SDKs that still
-        // ship `SteamFriends()`.
-        if (auto pFriends = reinterpret_cast<void* (*)()>(
-                GetProcAddress(sa, "SteamFriends"))) {
+        if (auto pFriends = reinterpret_cast<void* (*)()>(GetProcAddress(sa, "SteamFriends")))
             friends = pFriends();
-            if (friends) via = "SteamFriends() legacy";
-        }
-
-        // Path 2: factory for newer SDKs that no longer ship the flat
-        // accessor. SteamInternal_FindOrCreateUserInterface takes a version
-        // string ("SteamFriends018", etc.) and returns the corresponding
-        // vtable. We don't know which version the game baked in, and there
-        // is no API to enumerate what the steam_api dll supports, so scan a
-        // descending integer range. Any hit works for our use because
-        // GetPersonaName() lives in a vtable slot that has never moved
-        // across versions — the Steamworks ABI rule is append-only.
-        // First hit wins.
         if (!friends) {
-            auto pGetHUser = reinterpret_cast<int (*)()>(
-                GetProcAddress(sa, "SteamAPI_GetHSteamUser"));
-            auto pCreate = reinterpret_cast<void* (*)(int, const char*)>(
-                GetProcAddress(sa, "SteamInternal_FindOrCreateUserInterface"));
-            if (pGetHUser && pCreate) {
-                const int hUser = pGetHUser();
-                // Scan ascending — we only need GetPersonaName(), which has
-                // existed since V1 and (under append-only ABI) lives in the
-                // same vtable slot at every version. The lowest version the
-                // dll still ships is the cheapest to acquire and the most
-                // stable to use. 15 is the oldest baseline still seen in
-                // the wild; 30 is generous headroom over today's max (~020)
-                // for the rare cases where older versions have been dropped
-                // from the runtime.
-                char buf[16];
-                for (int v = 15; v <= 30; ++v) {
-                    std::snprintf(buf, sizeof(buf), "SteamFriends%03d", v);
-                    friends = pCreate(hUser, buf);
-                    if (friends) { via = buf; break; }
-                }
-            }
+            // Legacy accessor doesn't exist; utilizing the versioned one.
+            if (auto pFriends = reinterpret_cast<void* (*)()>(
+                    FindExportByPrefix(sa, "SteamAPI_SteamFriends_v")))
+                friends = pFriends();
         }
-
         if (!friends) {
-            PayloadLog::Write("SteamPersonaName: no ISteamFriends accessor worked "
-                              "(legacy + factory both null)");
+            PayloadLog::Write("SteamPersonaName: no ISteamFriends accessor found");
             return "Unknown Player";
         }
 
         const char* name = pName(friends);
-        if (!name || !*name) {
-            PayloadLog::Write(std::string("SteamPersonaName: GetPersonaName() empty via ")
-                              + via);
-            return "Unknown Player";
-        }
-        PayloadLog::Write(std::string("SteamPersonaName: ") + name + " (via " + via + ")");
-        return name;
+        return (name && *name) ? name : "Unknown Player";
     }
 
     void OnLoginDone(const EOS_Connect_LoginCallbackInfo* info) {
@@ -163,9 +125,7 @@ namespace {
         oLogin(ctx->handle, &opts, ctx, OnLoginDone);
     }
 
-    // Redirect the game's Steam-credentialed Connect login to anonymous Device
-    // ID auth. We preserve every ApiVersion the game passed and swap only the
-    // credential type, so the call stays correct across SDK versions.
+    // Preserve every ApiVersion the game passed; swap only the credential type.
     void hkLogin(EOS_HConnect h, const EOS_Connect_LoginOptions* opts,
                  void* cbData, EOS_Connect_OnLoginCb cb)
     {
@@ -177,11 +137,9 @@ namespace {
         ctx->credsApiVersion = (opts && opts->Credentials) ? opts->Credentials->ApiVersion : 1;
         ctx->hadUserInfo = opts && opts->UserLoginInfo;
         ctx->userInfoApiVersion = ctx->hadUserInfo ? opts->UserLoginInfo->ApiVersion : 0;
-        // Keep the game's display name if it supplied one; otherwise pull Steam's.
         const char* gameName = ctx->hadUserInfo ? opts->UserLoginInfo->DisplayName : nullptr;
         ctx->displayName = (gameName && *gameName) ? gameName : SteamPersonaName();
 
-        // Record the versions we carried through; a future SDK that shifts them should show up here.
         PayloadLog::Write("Connect_Login intercepted: login.v=" + std::to_string(ctx->loginApiVersion)
                           + " creds.v=" + std::to_string(ctx->credsApiVersion)
                           + " userInfo.v=" + std::to_string(ctx->userInfoApiVersion)
@@ -195,8 +153,9 @@ namespace {
         return EOS_Success;
     }
 
-    // bPresenceEnabled requires an Epic account we don't have. The field
-    // offset differs per struct because the preceding members differ.
+    // Clear bPresenceEnabled — it needs an Epic account we don't have.
+    // flagOffset: where the flag sits in this options struct.
+    // minApiVer: the ApiVersion that first added the flag; older options lack it.
     void StripPresence(const void* opts, size_t flagOffset, int32_t minApiVer) {
         if (!opts) return;
         if (*reinterpret_cast<const int32_t*>(opts) < minApiVer) return;

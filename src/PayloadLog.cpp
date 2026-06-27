@@ -13,14 +13,9 @@ namespace {
     std::mutex            g_mutex;
     std::atomic_bool      g_ready{false};
 
-    // Steam's own install path, so payload logs sit under <Steam>\opensteamtool
-    // next to OpenSteamTool's. Read from the registry since handshake injection
-    // can't seed the game's environment.
-    //
-    // The value here is a candidate, not an answer: Proton's per-game Wine
-    // prefix ships a stub at C:\Program Files (x86)\Steam that has this exact
-    // key set, but the directory is a per-prefix shell with no OST in it. The
-    // caller filters that case by requiring <Steam>\opensteamtool\ to exist.
+    // Steam's install path from the registry. This is a candidate, not an
+    // answer: Proton's per-game Wine prefix ships a Steam stub with this key
+    // set but no OST in it, so the caller must confirm opensteamtool\ exists.
     std::filesystem::path SteamRootFromRegistry() {
         HKEY key{};
         if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
@@ -37,23 +32,17 @@ namespace {
 }
 
 namespace PayloadLog {
-    void Init(HMODULE self) {
-        (void)self;
-
+    void Init(HMODULE /*self*/) {
         std::filesystem::path dir;
 
-        // 1. OST explicit override. Trust it without checking the directory:
-        //    OST set it because it wants logs there, even if it hasn't created
-        //    the tree yet.
         wchar_t steam[MAX_PATH] = {};
         if (DWORD n = GetEnvironmentVariableW(L"OPENSTEAMTOOL_STEAM_PATH", steam, MAX_PATH);
             n > 0 && n < MAX_PATH) {
             dir = std::filesystem::path(steam) / "opensteamtool" / "payload";
         }
 
-        // 2. Registry candidate. Only accept it when <Steam>\opensteamtool\
-        //    actually exists, which is true on a Windows host with OST
-        //    installed and false on Proton's per-prefix Steam stub.
+        // Accept the registry path only if opensteamtool\ exists there — tells a
+        // real OST install apart from a Proton per-prefix Steam stub.
         if (dir.empty()) {
             if (auto root = SteamRootFromRegistry(); !root.empty()) {
                 auto candidate = root / "opensteamtool";
@@ -64,8 +53,6 @@ namespace PayloadLog {
             }
         }
 
-        // 3. Standalone (Proton, non-OST hosts, anything else): %APPDATA%
-        //    with %TEMP% as a fallback when APPDATA is unset.
         if (dir.empty()) {
             wchar_t userDir[MAX_PATH] = {};
             DWORD n2 = GetEnvironmentVariableW(L"APPDATA", userDir, MAX_PATH);
