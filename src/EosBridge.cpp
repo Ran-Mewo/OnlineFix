@@ -22,6 +22,7 @@
 #include "PayloadLog.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <detours.h>
 
@@ -52,16 +53,84 @@ namespace {
 
     // EOS Device ID login requires a display name. Steam is already loaded
     // in the game process by the time EOS comes up, so walk steam_api.
+    //
+    // Two interface-acquisition paths because not every Steamworks SDK
+    // release ships the legacy `SteamFriends()` flat accessor — newer SDKs
+    // only expose the `SteamAPI_ISteamFriends_*` per-method helpers and the
+    // `SteamInternal_FindOrCreateUserInterface` factory.
     std::string SteamPersonaName() {
         HMODULE sa = GetModuleHandleW(L"steam_api64.dll");
         if (!sa) sa = GetModuleHandleW(L"steam_api.dll");
+        if (!sa) {
+            PayloadLog::Write("SteamPersonaName: steam_api{,64}.dll not loaded");
+            return "Unknown Player";
+        }
 
-        auto pFriends = sa ? reinterpret_cast<void* (*)()>(GetProcAddress(sa, "SteamFriends")) : nullptr;
-        auto pName    = sa ? reinterpret_cast<const char* (*)(void*)>(GetProcAddress(sa, "SteamAPI_ISteamFriends_GetPersonaName")) : nullptr;
+        auto pName = reinterpret_cast<const char* (*)(void*)>(
+            GetProcAddress(sa, "SteamAPI_ISteamFriends_GetPersonaName"));
+        if (!pName) {
+            PayloadLog::Write("SteamPersonaName: SteamAPI_ISteamFriends_GetPersonaName missing");
+            return "Unknown Player";
+        }
 
-        void* friends = pFriends ? pFriends() : nullptr;
-        const char* name = (pName && friends) ? pName(friends) : nullptr;
-        return (name && *name) ? name : "Unknown Player";
+        void* friends = nullptr;
+        std::string via = "(none)";
+
+        // Path 1: legacy flat accessor — present in older SDKs that still
+        // ship `SteamFriends()`.
+        if (auto pFriends = reinterpret_cast<void* (*)()>(
+                GetProcAddress(sa, "SteamFriends"))) {
+            friends = pFriends();
+            if (friends) via = "SteamFriends() legacy";
+        }
+
+        // Path 2: factory for newer SDKs that no longer ship the flat
+        // accessor. SteamInternal_FindOrCreateUserInterface takes a version
+        // string ("SteamFriends018", etc.) and returns the corresponding
+        // vtable. We don't know which version the game baked in, and there
+        // is no API to enumerate what the steam_api dll supports, so scan a
+        // descending integer range. Any hit works for our use because
+        // GetPersonaName() lives in a vtable slot that has never moved
+        // across versions — the Steamworks ABI rule is append-only.
+        // First hit wins.
+        if (!friends) {
+            auto pGetHUser = reinterpret_cast<int (*)()>(
+                GetProcAddress(sa, "SteamAPI_GetHSteamUser"));
+            auto pCreate = reinterpret_cast<void* (*)(int, const char*)>(
+                GetProcAddress(sa, "SteamInternal_FindOrCreateUserInterface"));
+            if (pGetHUser && pCreate) {
+                const int hUser = pGetHUser();
+                // Scan ascending — we only need GetPersonaName(), which has
+                // existed since V1 and (under append-only ABI) lives in the
+                // same vtable slot at every version. The lowest version the
+                // dll still ships is the cheapest to acquire and the most
+                // stable to use. 15 is the oldest baseline still seen in
+                // the wild; 30 is generous headroom over today's max (~020)
+                // for the rare cases where older versions have been dropped
+                // from the runtime.
+                char buf[16];
+                for (int v = 15; v <= 30; ++v) {
+                    std::snprintf(buf, sizeof(buf), "SteamFriends%03d", v);
+                    friends = pCreate(hUser, buf);
+                    if (friends) { via = buf; break; }
+                }
+            }
+        }
+
+        if (!friends) {
+            PayloadLog::Write("SteamPersonaName: no ISteamFriends accessor worked "
+                              "(legacy + factory both null)");
+            return "Unknown Player";
+        }
+
+        const char* name = pName(friends);
+        if (!name || !*name) {
+            PayloadLog::Write(std::string("SteamPersonaName: GetPersonaName() empty via ")
+                              + via);
+            return "Unknown Player";
+        }
+        PayloadLog::Write(std::string("SteamPersonaName: ") + name + " (via " + via + ")");
+        return name;
     }
 
     void OnLoginDone(const EOS_Connect_LoginCallbackInfo* info) {
