@@ -1,0 +1,65 @@
+name: Release
+run-name: ${{ github.event.inputs.version }} Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v1.0.0)"
+        required: true
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build -G "Ninja Multi-Config" -DONLINEFIX_VERSION="${{ github.event.inputs.version }}"
+
+      - name: Build Release
+        run: cmake --build build --config Release
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          {
+            echo 'changelog<<EOF'
+            git log -1 --pretty=format:"- %s%n%b"
+            echo ''
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Create tag
+        run: |
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs.version }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          body: |
+            ## Changes
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ## Installation
+
+            Download `OnlineFix.dll` and drop it next to `steam.exe` (or anywhere; use an absolute path below).
+
+            Add an entry to `opensteamtool.toml`:
+            ```toml
+            [[inject]]
+            path = "OnlineFix.dll"
+            when_cmdline = "-onlinefix"
+            ```
+
+            Launch the game with `-onlinefix` in its Steam launch options.
+          files: build/Release/OnlineFix.dll

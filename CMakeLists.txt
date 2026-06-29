@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
-project(OnlineFix VERSION 1.0.0 LANGUAGES CXX)
+
+# Release builds set this (e.g. -DONLINEFIX_VERSION=v1.0.0); strip a leading
+# "v" so it fits CMake's numeric project() VERSION, and fall back to a default.
+set(ONLINEFIX_VERSION "" CACHE STRING "Release version, e.g. v1.0.0")
+if(ONLINEFIX_VERSION STREQUAL "")
+    set(_onlinefix_proj_version 1.0.0)
+    set(ONLINEFIX_VERSION "1.0.0")
+else()
+    string(REGEX REPLACE "^v" "" _onlinefix_proj_version "${ONLINEFIX_VERSION}")
+endif()
+
+project(OnlineFix VERSION ${_onlinefix_proj_version} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +70,7 @@ endif()
 # Logging is compiled in only for Debug, same convention as OpenSteamTool.
 target_compile_definitions(OnlineFix PRIVATE
     $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
+    ONLINEFIX_VERSION="${ONLINEFIX_VERSION}"
 )
 if(MINGW)
     # mingw-w64 gates localtime_s behind the C11 Annex K opt-in.
