@@ -1,0 +1,29 @@
+#pragma once
+
+// ─────────────────────────────────────────────────────────────────
+//  SteamAuthBridge — makes Steam auth-session tickets succeed for games
+//  whose matchmaking needs one but which get a failing ticket under the
+//  480 AppId spoof.
+//
+//  Why this exists: some games (e.g. R.E.P.O via Photon) call
+//  ISteamUser::GetAuthSessionTicket and hand the bytes to their backend.
+//  Facepunch's wrapper returns null when the underlying call yields a
+//  zero handle, and the game then dereferences it → NullReferenceException
+//  before it ever connects. We hook the flat steam_api64.dll exports
+//  in-process (same Detours discipline as EosBridge) and, ONLY when the
+//  real call fails, forge a non-empty ticket + post the success callback.
+//
+//  No-regression by construction: we call the real export first and pass
+//  its result through untouched whenever Steam succeeds — so games that
+//  already get valid tickets (Steam P2P peer auth, etc.) are unaffected.
+//  The forge path engages exclusively on the real-failure case.
+// ─────────────────────────────────────────────────────────────────
+
+namespace SteamAuthBridge {
+
+    // Hook the auth-ticket flat exports in the already-loaded
+    // steam_api64.dll. Idempotent; no-op if steam_api isn't present yet.
+    // Call from the payload once Steam's API module is loaded.
+    void Install();
+
+} // namespace SteamAuthBridge

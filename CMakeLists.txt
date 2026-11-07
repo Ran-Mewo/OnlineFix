@@ -1,16 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-
-# Release builds set this (e.g. -DONLINEFIX_VERSION=v1.0.0); strip a leading
-# "v" so it fits CMake's numeric project() VERSION, and fall back to a default.
-set(ONLINEFIX_VERSION "" CACHE STRING "Release version, e.g. v1.0.0")
-if(ONLINEFIX_VERSION STREQUAL "")
-    set(_onlinefix_proj_version 1.0.0)
-    set(ONLINEFIX_VERSION "1.0.0")
-else()
-    string(REGEX REPLACE "^v" "" _onlinefix_proj_version "${ONLINEFIX_VERSION}")
-endif()
-
-project(OnlineFix VERSION ${_onlinefix_proj_version} LANGUAGES CXX)
+project(OnlineFix VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,8 +18,8 @@ include(FetchContent)
 FetchContent_Declare(
     detours
     GIT_REPOSITORY https://github.com/microsoft/Detours.git
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
+    GIT_TAG        1dbd4ea281d73d478aa8d09a8b83fbd265f715f7  # pinned commit: a moving main could change the ABI/build out from under us
+    GIT_SHALLOW    FALSE
     SOURCE_SUBDIR  cmake-noop  # repo ships no CMake build of its own
 )
 FetchContent_MakeAvailable(detours)
@@ -55,11 +44,28 @@ endif()
 add_library(OnlineFix SHARED
     src/dllmain.cpp
     src/EosBridge.cpp
+    src/MonoBridge.cpp
+    src/NativeNet.cpp
+    src/PlayFabBridge.cpp
+    src/PhotonBridge.cpp
+    src/PhotonProtocol.cpp
+    src/PhotonEnet.cpp
+    src/PhotonServer.cpp
+    src/PhotonEmulator.cpp
+    src/AppIdStrategy.cpp
+    src/SteamRelay.cpp
+    # src/SteamAuthBridge.cpp   # disabled: a 480 session gets a real auth ticket (SteamAuthBridge.cpp.disabled)
+    src/SteamApi.cpp
+    src/SteamEnv.cpp
+    src/Hook.cpp
     src/PayloadLog.cpp
 )
 set_target_properties(OnlineFix PROPERTIES PREFIX "" OUTPUT_NAME "OnlineFix")
 target_include_directories(OnlineFix PRIVATE src)
 # advapi32 (registry) is implicit under MSVC but must be explicit for MinGW.
+# HTTP stacks (winhttp/wininet) and Steam APIs are resolved at runtime via
+# GetProcAddress, so they are deliberately NOT linked here — that keeps them
+# out of games that don't use them and makes presence checks meaningful.
 target_link_libraries(OnlineFix PRIVATE detours psapi advapi32)
 
 if(MINGW)
@@ -70,11 +76,34 @@ endif()
 # Logging is compiled in only for Debug, same convention as OpenSteamTool.
 target_compile_definitions(OnlineFix PRIVATE
     $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
-    ONLINEFIX_VERSION="${ONLINEFIX_VERSION}"
 )
 if(MINGW)
     # mingw-w64 gates localtime_s behind the C11 Annex K opt-in.
     target_compile_definitions(OnlineFix PRIVATE
         $<$<CONFIG:Debug>:__STDC_WANT_LIB_EXT1__=1>
     )
+endif()
+
+# ── Standalone Photon protocol self-test ───────────────────────────
+# Builds only when ONLINEFIX_BUILD_TESTS is set. Checks the Photon codecs and emulator without a game or injection.
+option(ONLINEFIX_BUILD_TESTS "Build OnlineFix unit tests" OFF)
+if(ONLINEFIX_BUILD_TESTS)
+    add_executable(PhotonProtocolTest
+        src/PhotonProtocol.cpp
+        src/PhotonEnet.cpp
+        test/PhotonProtocolTest.cpp
+    )
+    target_include_directories(PhotonProtocolTest PRIVATE src)
+
+    # The whole serverless Photon stack driven end to end by scripted clients, SteamRelay stubbed in the test.
+    add_executable(PhotonEmulatorTest
+        src/PhotonEmulator.cpp
+        src/PhotonServer.cpp
+        src/PhotonProtocol.cpp
+        src/PhotonEnet.cpp
+        src/PayloadLog.cpp
+        test/PhotonEmulatorTest.cpp
+    )
+    target_include_directories(PhotonEmulatorTest PRIVATE src)
+    target_compile_definitions(PhotonEmulatorTest PRIVATE OPENSTEAMTOOL_LOGGING_ENABLED)
 endif()

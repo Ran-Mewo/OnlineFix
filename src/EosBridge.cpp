@@ -8,11 +8,15 @@
 
 #include "EosBridge.h"
 #include "EosTypes.h"
+#include "AppIdStrategy.h"
+#include "SteamApi.h"
+#include "Hook.h"
 #include "PayloadLog.h"
 
+#include <windows.h>
 #include <atomic>
 #include <cstring>
-#include <detours.h>
+#include <vector>
 
 namespace {
     std::atomic_bool g_installed{false};
@@ -37,60 +41,15 @@ namespace {
         std::string             displayName;
     };
 
-    // Locate the versioned ISteamFriends accessor the SDK ships
-    // (SteamAPI_SteamFriends_v017, _v018, ...) without guessing the number.
-    FARPROC FindExportByPrefix(HMODULE mod, const char* prefix) {
-        auto base = reinterpret_cast<const BYTE*>(mod);
-        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-        const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        if (!dir.VirtualAddress) return nullptr;
-
-        const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
-        const auto* names   = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
-        const auto* ordinals= reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
-        const auto* funcs   = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
-        const size_t prefixLen = std::strlen(prefix);
-
-        for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
-            const char* name = reinterpret_cast<const char*>(base + names[i]);
-            if (std::strncmp(name, prefix, prefixLen) == 0)
-                return reinterpret_cast<FARPROC>(const_cast<BYTE*>(base + funcs[ordinals[i]]));
-        }
-        return nullptr;
-    }
-
     // EOS Device ID login needs a display name; use the Steam persona name.
     std::string SteamPersonaName() {
-        HMODULE sa = GetModuleHandleW(L"steam_api64.dll");
-        if (!sa) sa = GetModuleHandleW(L"steam_api.dll");
-        if (!sa) {
-            PayloadLog::Write("SteamPersonaName: steam_api{,64}.dll not loaded");
-            return "Unknown Player";
-        }
-
         auto pName = reinterpret_cast<const char* (*)(void*)>(
-            GetProcAddress(sa, "SteamAPI_ISteamFriends_GetPersonaName"));
-        if (!pName) {
-            PayloadLog::Write("SteamPersonaName: SteamAPI_ISteamFriends_GetPersonaName missing");
+            SteamApi::Export("SteamAPI_ISteamFriends_GetPersonaName"));
+        void* friends = SteamApi::Interface("SteamAPI_SteamFriends", "SteamFriends");
+        if (!pName || !friends) {
+            PayloadLog::Write("SteamPersonaName: no ISteamFriends accessor");
             return "Unknown Player";
         }
-
-        // Prefer the legacy flat accessor; newer SDKs only ship the versioned one.
-        void* friends = nullptr;
-        if (auto pFriends = reinterpret_cast<void* (*)()>(GetProcAddress(sa, "SteamFriends")))
-            friends = pFriends();
-        if (!friends) {
-            // Legacy accessor doesn't exist; utilizing the versioned one.
-            if (auto pFriends = reinterpret_cast<void* (*)()>(
-                    FindExportByPrefix(sa, "SteamAPI_SteamFriends_v")))
-                friends = pFriends();
-        }
-        if (!friends) {
-            PayloadLog::Write("SteamPersonaName: no ISteamFriends accessor found");
-            return "Unknown Player";
-        }
-
         const char* name = pName(friends);
         return (name && *name) ? name : "Unknown Player";
     }
@@ -135,7 +94,8 @@ namespace {
         ctx->cbData      = cbData;
         ctx->loginApiVersion = opts ? opts->ApiVersion : 1;
         ctx->credsApiVersion = (opts && opts->Credentials) ? opts->Credentials->ApiVersion : 1;
-        ctx->hadUserInfo = opts && opts->UserLoginInfo;
+        // UserLoginInfo was added in LoginOptions API v2; on a v1 struct that pointer field doesn't exist, so never read it there.
+        ctx->hadUserInfo = opts && opts->ApiVersion >= 2 && opts->UserLoginInfo;
         ctx->userInfoApiVersion = ctx->hadUserInfo ? opts->UserLoginInfo->ApiVersion : 0;
         const char* gameName = ctx->hadUserInfo ? opts->UserLoginInfo->DisplayName : nullptr;
         ctx->displayName = (gameName && *gameName) ? gameName : SteamPersonaName();
@@ -189,27 +149,30 @@ namespace EosBridge {
         bool expected = false;
         if (!eos || !g_installed.compare_exchange_strong(expected, true)) return;
 
-        bool ok = Resolve(eos, "EOS_Connect_Login",                          oLogin)
-                & Resolve(eos, "EOS_Connect_CreateDeviceId",                 oCreateDeviceId)
-                & Resolve(eos, "EOS_IntegratedPlatformOptionsContainer_Add", oIPOAdd)
-                & Resolve(eos, "EOS_Lobby_CreateLobby",                      oCreateLobby)
-                & Resolve(eos, "EOS_Lobby_JoinLobby",                        oJoinLobby)
-                & Resolve(eos, "EOS_Lobby_JoinLobbyById",                    oJoinLobbyById);
-        if (!ok) { g_installed.store(false); return; }
+        // The login reroute is the whole point and needs both exports; the lobby presence strips are a bonus, so hook only those a given
+        // SDK version actually ships. That keeps the bridge working on older/newer EOS SDKs instead of all-or-nothing.
+        if (!Resolve(eos, "EOS_Connect_Login", oLogin) | !Resolve(eos, "EOS_Connect_CreateDeviceId", oCreateDeviceId)) {
+            g_installed.store(false);
+            return;
+        }
+        Resolve(eos, "EOS_IntegratedPlatformOptionsContainer_Add", oIPOAdd);
+        Resolve(eos, "EOS_Lobby_CreateLobby",   oCreateLobby);
+        Resolve(eos, "EOS_Lobby_JoinLobby",     oJoinLobby);
+        Resolve(eos, "EOS_Lobby_JoinLobbyById", oJoinLobbyById);
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-        DetourAttach(reinterpret_cast<PVOID*>(&oLogin),         reinterpret_cast<PVOID>(hkLogin));
-        DetourAttach(reinterpret_cast<PVOID*>(&oIPOAdd),        reinterpret_cast<PVOID>(hkIPOAdd));
-        DetourAttach(reinterpret_cast<PVOID*>(&oCreateLobby),   reinterpret_cast<PVOID>(hkCreateLobby));
-        DetourAttach(reinterpret_cast<PVOID*>(&oJoinLobby),     reinterpret_cast<PVOID>(hkJoinLobby));
-        DetourAttach(reinterpret_cast<PVOID*>(&oJoinLobbyById), reinterpret_cast<PVOID>(hkJoinLobbyById));
-        LONG err = DetourTransactionCommit();
-        if (err != NO_ERROR) {
-            PayloadLog::Write("DetourTransactionCommit failed err=" + std::to_string(err));
+        std::vector<Hook::Pair> hooks{ { reinterpret_cast<void**>(&oLogin), reinterpret_cast<void*>(hkLogin) } };
+        if (oIPOAdd)        hooks.push_back({ reinterpret_cast<void**>(&oIPOAdd),        reinterpret_cast<void*>(hkIPOAdd) });
+        if (oCreateLobby)   hooks.push_back({ reinterpret_cast<void**>(&oCreateLobby),   reinterpret_cast<void*>(hkCreateLobby) });
+        if (oJoinLobby)     hooks.push_back({ reinterpret_cast<void**>(&oJoinLobby),     reinterpret_cast<void*>(hkJoinLobby) });
+        if (oJoinLobbyById) hooks.push_back({ reinterpret_cast<void**>(&oJoinLobbyById), reinterpret_cast<void*>(hkJoinLobbyById) });
+
+        if (!Hook::Attach(hooks.data(), hooks.size())) {
+            PayloadLog::Write("EOS: hook transaction failed");
             g_installed.store(false);
             return;
         }
         PayloadLog::Write("EOS hooks installed");
+        // EOS games need the real appid throughout, otherwise the game can abort launch or EOS multiplayer stops working. EOS needs no 480 cert.
+        AppIdStrategy::Set(AppIdStrategy::ForceReal);
     }
 }

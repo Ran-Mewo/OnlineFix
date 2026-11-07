@@ -1,0 +1,144 @@
+#include "SteamAuthBridge.h"
+#include "SteamApi.h"
+#include "Hook.h"
+#include "PayloadLog.h"
+
+#include <windows.h>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+
+// ─────────────────────────────────────────────────────────────────
+//  Under the AppId-480 spoof, ISteamUser::GetAuthSessionTicket returns a
+//  zero handle, so games that feed the ticket to their backend (e.g.
+//  Photon) get null and crash. We hook the flat steam_api64 export and,
+//  only when the real call fails, fill the buffer with a forged ticket.
+//  Real successes pass through untouched, so Steam P2P auth is unaffected.
+// ─────────────────────────────────────────────────────────────────
+
+namespace {
+    std::atomic_bool g_installed{false};
+
+    using HAuthTicket = uint32_t;
+
+    using GetAuthSessionTicket_t =
+        HAuthTicket(__cdecl*)(void* self, void* pTicket, int cbMaxTicket,
+                              uint32_t* pcbTicket, void* pIdentity);
+    using GetAuthTicketForWebApi_t =
+        HAuthTicket(__cdecl*)(void* self, const char* pchIdentity);
+
+    GetAuthSessionTicket_t   oGetAuthSessionTicket   = nullptr;
+    GetAuthTicketForWebApi_t oGetAuthTicketForWebApi = nullptr;
+
+    std::atomic<uint32_t> g_fakeHandle{0x4F46'0001};  // "OF" + counter
+
+    uint32_t WriteForgedTicket(uint8_t* p, int cbMax);  // fwd
+
+    // Forge a GC auth-session ticket: a gameconnect token + session header,
+    // embedding the real SteamID. Not server-validatable, but only our own
+    // emulator consumes it. Returns bytes written, 0 if the buffer's small.
+    // SEH-guarded raw write. Some Steam call paths under the 480 spoof invoke
+    // our hook with a bad pTicket; a fault means "not a real ticket buffer",
+    // so report 0 instead of crashing. No C++ objects here so __try is legal.
+    uint32_t WriteForgedBytes(uint8_t* p, uint64_t steamId, uint32_t now) {
+        __try {
+            std::memset(p, 0, 52);
+            uint32_t a; uint64_t b;
+            // ── gameconnect token ──
+            a = 20;                     std::memcpy(p + 0,  &a, 4);  // token length
+            b = 0x0123456789ABCDEFull;  std::memcpy(p + 4,  &b, 8);  // gc token id (opaque, nonzero)
+            b = steamId;                std::memcpy(p + 12, &b, 8);  // owner SteamID
+            a = now;                    std::memcpy(p + 20, &a, 4);  // token time
+            // ── session header ──
+            a = 24;                     std::memcpy(p + 24, &a, 4);  // session section length
+            a = 1;                      std::memcpy(p + 28, &a, 4);  // version
+            a = 0;                      std::memcpy(p + 32, &a, 4);  // public IP (unknown -> 0)
+            a = 0;                      std::memcpy(p + 36, &a, 4);  // filler
+            a = now;                    std::memcpy(p + 40, &a, 4);  // ticket generation time (ms)
+            a = 1;                      std::memcpy(p + 44, &a, 4);  // connection count
+            a = 0;                      std::memcpy(p + 48, &a, 4);  // reserved
+            return 52u;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0u;
+        }
+    }
+
+    uint32_t WriteForgedTicket(uint8_t* p, int cbMax) {
+        constexpr uint32_t kLen = 52;             // GC token (24) + session (28)
+        // The caller (hook) has already vetted this as a ticket request; only
+        // require room for our 52 bytes. The SEH in WriteForgedBytes covers a
+        // bad pointer regardless.
+        if (!p || cbMax < (int)kLen) return 0;
+        return WriteForgedBytes(p, SteamApi::LocalSteamId(), GetTickCount());
+    }
+
+    using Orig6_t = HAuthTicket(__cdecl*)(void*, void*, void*, void*, void*, void*);
+
+    // In OnlineFix's steam_api64, GetAuthSessionTicket and GetAPICallResult
+    // share one export address (verified: gast == gacr), so our detour also
+    // intercepts GetAPICallResult — which CreateLobby and every async Steam
+    // call rely on. Take six generic args (the GetAPICallResult superset) and
+    // forge ONLY for a genuine GetAuthSessionTicket(self, pTicket, cbMaxTicket,
+    // pcbTicket, pIdentity): cbMaxTicket (arg3) is a small buffer size and
+    // pcbTicket (arg4) is a real pointer. Everything else passes straight
+    // through with all six args preserved.
+    HAuthTicket __cdecl hkGetAuthSessionTicket(void* a1, void* a2, void* a3,
+                                               void* a4, void* a5, void* a6) {
+        auto orig = reinterpret_cast<Orig6_t>(oGetAuthSessionTicket);
+        // GetAuthSessionTicket: arg3 = cbMaxTicket, a small buffer size
+        // (R.E.P.O uses 256 KB), and arg4 = pcbTicket, a real pointer.
+        // GetAPICallResult (shares this export): arg3 = pCallback, a heap
+        // pointer (orders of magnitude larger), arg4 = a small int. So a size
+        // well under any pointer + a pointer-valued arg4 identifies the former.
+        const uintptr_t cbMax = (uintptr_t)a3;
+        const bool isAuthTicket = cbMax >= 52 && cbMax <= 0x1000000 && (uintptr_t)a4 > 0x10000;
+        if (!isAuthTicket) return orig(a1, a2, a3, a4, a5, a6);
+
+        const uint32_t n = WriteForgedTicket(static_cast<uint8_t*>(a2), (int)cbMax);
+        if (!n) return orig(a1, a2, a3, a4, a5, a6);
+        *static_cast<uint32_t*>(a4) = n;
+        const HAuthTicket fake = g_fakeHandle.fetch_add(1);
+        PayloadLog::Write("SteamAuth: GetAuthSessionTicket -> forged handle="
+                          + std::to_string(fake) + " bytes=" + std::to_string(n));
+        return fake;
+    }
+
+    // TODO: forge the async GetAuthTicketForWebApi path too. Delivering it
+    // means injecting a callback into Steam's pump, which crashed the game
+    // when done via ManualDispatch detours — needs a safer mechanism.
+    HAuthTicket __cdecl hkGetAuthTicketForWebApi(void* self, const char* pchIdentity) {
+        return oGetAuthTicketForWebApi(self, pchIdentity);
+    }
+}
+
+namespace SteamAuthBridge {
+
+    void Install() {
+        bool expected = false;
+        if (!g_installed.compare_exchange_strong(expected, true)) return;
+
+        if (!SteamApi::Module()) { g_installed.store(false); return; }
+        oGetAuthSessionTicket = reinterpret_cast<GetAuthSessionTicket_t>(
+            SteamApi::Export("SteamAPI_ISteamUser_GetAuthSessionTicket"));
+        oGetAuthTicketForWebApi = reinterpret_cast<GetAuthTicketForWebApi_t>(
+            SteamApi::Export("SteamAPI_ISteamUser_GetAuthTicketForWebApi"));
+
+        if (!oGetAuthSessionTicket) {
+            PayloadLog::Write("SteamAuth: no GetAuthSessionTicket export");
+            g_installed.store(false);
+            return;
+        }
+
+        // Only GetAuthSessionTicket is hooked. The flat exports alias each other in this steam_api64 (gast == gacr), so touching
+        // GetAuthTicketForWebApi would risk hijacking an unrelated export; it's a no-op pass-through anyway.
+        if (!Hook::Attach({ { reinterpret_cast<void**>(&oGetAuthSessionTicket),
+                              reinterpret_cast<void*>(hkGetAuthSessionTicket) } })) {
+            PayloadLog::Write("SteamAuth: hook transaction failed");
+            g_installed.store(false);
+            return;
+        }
+        PayloadLog::Write(std::string("SteamAuth: installed (webapi=")
+                          + (oGetAuthTicketForWebApi ? "1" : "0") + ")");
+    }
+
+} // namespace SteamAuthBridge
