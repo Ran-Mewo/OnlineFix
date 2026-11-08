@@ -29,12 +29,14 @@ namespace {
     std::vector<Sent>    g_sent;
     std::vector<uint8_t> g_published;
     int                  g_registryReads = 0;
+    std::vector<SteamRelay::SteamId> g_joinedHosts, g_leftHosts;
 }
 namespace SteamRelay {
     bool Init(const Callbacks&) { return true; }
     void Publish(const std::vector<uint8_t>& blob) { g_published = blob; }
     bool RequestRegistry() { ++g_registryReads; return true; }
-    void JoinHostLobby(SteamId) {}
+    void JoinHostLobby(SteamId host) { g_joinedHosts.push_back(host); }
+    void LeaveHostLobby(SteamId host) { g_leftHosts.push_back(host); }
     bool Send(SteamId peer, const uint8_t* data, size_t len, bool reliable) {
         g_sent.push_back({ peer, std::vector<uint8_t>(data, data + len), reliable });
         return true;
@@ -430,6 +432,7 @@ int main() {
         const auto open = LastSent(1);   // FOpen
         Expect(open && open->to == 77 && std::string(open->frame.begin() + 5, open->frame.end()) == kAppKey + "\nuserJ",
                "J: opens a connection on the host with its app and user id");
+        Expect(!g_joinedHosts.empty() && g_joinedHosts.back() == 77, "J: joins the host's registry and Steam lobbies when it connects there");
         j.Op(226, { { 255, Value::Str("far") } });
         const auto req = LastSent(2);    // FRequest
         Message tunnelled;
@@ -439,8 +442,15 @@ int main() {
         const auto replyFrame = Frame(4, conn, Photon::WriteOperationResponse(226, 0, { { 254, Value::I32(2) } }));
         PhotonEmulator::OnRelayMessage(77, replyFrame.data(), replyFrame.size());
         Expect(j.Response(226) && j.Response(226)->returnCode == 0, "J: the host's reply reaches the client");
+        Expect(g_leftHosts.empty(), "J: stays in the host's Steam lobby while it plays there");
+        j.Disconnect();
+        Expect(g_leftHosts == std::vector<SteamRelay::SteamId>{ 77 }, "J: leaves the host's Steam lobby with its last connection there");
+        j.Connect(false);
+        j.Op(230, { { 221, Value::Str(j.token) } });
+        g_leftHosts.clear();
         PhotonEmulator::OnRelayPeerLeft(77);
         Expect(j.disconnected && j.disconnectReason == 2, "J: losing the host is a server timeout to the client");
+        Expect(g_leftHosts == std::vector<SteamRelay::SteamId>{ 77 }, "J: leaves the Steam lobby of a host that is gone");
     }
 
     std::printf("rooms are listed only in their own lobby\n");

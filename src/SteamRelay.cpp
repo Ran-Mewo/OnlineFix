@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────
@@ -109,6 +110,7 @@ namespace {
     constexpr char kTagFlag[]      = "ofx";
     constexpr char kTagHost[]      = "ofx_host";   // host SteamId (the owner is unreadable in list results)
     constexpr char kTagPublished[] = "ofx_data";   // the host's published blob, hex
+    constexpr char kTagGameLobby[] = "ofx_lobby";  // the host game's Steam lobby
     constexpr size_t kMaxLobbyValue = 8192;         // k_cubChatMetadataMax
 
     // ── Resolved exports ────────────────────────────────────────────
@@ -144,6 +146,7 @@ namespace {
     using GetLobbyData_t     = const char* (*)(void*, uint64_t, const char*);
     using GetLobbyOwner_t    = uint64_t  (*)(void*, uint64_t);
     using GetLobbyByIndex_t  = uint64_t  (*)(void*, int);
+    using LeaveLobby_t       = void      (*)(void*, uint64_t);
     using AddStrFilter_t     = void      (*)(void*, const char*, const char*, int);
     using AddDistFilter_t    = void      (*)(void*, int);   // ELobbyDistanceFilter
     CreateLobby_t      pCreateLobby      = nullptr;
@@ -156,6 +159,7 @@ namespace {
     GetLobbyData_t     pGetLobbyData     = nullptr;
     GetLobbyOwner_t    pGetLobbyOwner    = nullptr;
     GetLobbyByIndex_t  pGetLobbyByIndex  = nullptr;
+    LeaveLobby_t       pLeaveLobby       = nullptr;
     AddStrFilter_t     pAddStrFilter     = nullptr;
     AddDistFilter_t    pAddDistFilter    = nullptr;
     constexpr int      kLobbyDistWorldwide = 3;   // k_ELobbyDistanceFilterWorldwide
@@ -174,12 +178,16 @@ namespace {
     void*                 g_matchmaking = nullptr;
     SteamRelay::SteamId   g_localId = 0;
     std::atomic<uint64_t> g_ourLobby{0};             // the registry lobby we host
+    std::atomic<uint64_t> g_gameLobby{0};            // the Steam lobby the game last entered itself
+    std::atomic<uint64_t> g_hideEnter{0};            // the Steam lobby we're joining for the game (JoinGameLobby)
     std::atomic<uint64_t> g_pendingCreateCall{0};
     std::atomic<uint64_t> g_pendingListCall{0};
     std::mutex            g_mutex;                   // what follows is shared with the game threads that publish and send
     std::string           g_published;               // hex of the blob we publish
     std::map<SteamRelay::SteamId, uint64_t> g_hostLobby;   // discovered host -> its registry lobby
     std::atomic<uint64_t> g_joinedHostLobby{0};      // host lobby WE joined (as a joiner)
+    uint64_t              g_lobbyForGame = 0;        // the host's Steam lobby we joined for the game, and that host
+    SteamRelay::SteamId   g_lobbyForGameHost = 0;
     std::vector<SteamRelay::HostListing> g_discovered;  // this browse so far (pump thread only)
     std::unordered_set<uint64_t>         g_pendingData; // result lobbies awaiting RequestLobbyData (pump thread only)
 
@@ -296,6 +304,38 @@ namespace {
         pSetLobbyData(g_matchmaking, lobby, kTagPublished, g_published.c_str());
     }
 
+    void PublishGameLobby() {
+        const uint64_t ours = g_ourLobby.load(), game = g_gameLobby.load();
+        if (ours && game && pSetLobbyData) pSetLobbyData(g_matchmaking, ours, kTagGameLobby, std::to_string(game).c_str());
+    }
+
+    // The game joined a Steam lobby on its own. If it's the one we joined for it, forget it, so LeaveHostLobby doesn't take the game out of it.
+    void NoteGameLobby(uint64_t lobby) {
+        g_gameLobby.store(lobby);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_lobbyForGame == lobby) g_lobbyForGame = 0;
+        }
+        PublishGameLobby();
+    }
+
+    // Friends can only "Join Game" through a player in the host's Steam lobby, but games that join the host's room by its name never join that
+    // Steam lobby, so we join it for them. The game isn't sent this LobbyEnter, as it otherwise gets games stuck in a ghost lobby if they join it on their own later.
+    void JoinGameLobby(SteamRelay::SteamId host, uint64_t registry) {
+        const char* id = pGetLobbyData ? pGetLobbyData(g_matchmaking, registry, kTagGameLobby) : nullptr;
+        const uint64_t lobby = id ? strtoull(id, nullptr, 10) : 0;
+        if (!lobby || lobby == g_gameLobby.load()) return;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_lobbyForGame == lobby) return;
+            g_lobbyForGame     = lobby;
+            g_lobbyForGameHost = host;
+        }
+        g_hideEnter.store(lobby);
+        pJoinLobby(g_matchmaking, lobby);
+        PayloadLog::Write("SteamRelay: joining host " + std::to_string(host) + "'s Steam lobby " + std::to_string(lobby));
+    }
+
     void OnEnteredLobby(uint64_t lobby, uint32_t enterResp = 1) {
         if (!lobby) return;
         if (lobby == g_ourLobby.load()) {
@@ -306,6 +346,7 @@ namespace {
                 pSetLobbyData(g_matchmaking, lobby, kTagHost, std::to_string(g_localId).c_str());
             }
             PublishToLobby(lobby);
+            PublishGameLobby();
             MakeDiscoverable(lobby);
             PayloadLog::Write("SteamRelay: hosting registry lobby " + std::to_string(lobby) + " tagged " + kTagKey + "=" + tag);
             LogRelayStatus("host");
@@ -475,10 +516,12 @@ namespace {
             if (got && msg && msg->m_pubParam) {
                 const uint64_t lobby = LobbyOf(msg);
                 if (msg->m_iCallback == k_iLobbyCreated && !IsOurLobby(lobby) && IsOurCreation(pipe, lobby, msg->m_cubParam)) AdoptRegistryLobby(lobby);
-                const bool hide = IsOurLobby(lobby);   // decided before the handlers below retire a lobby from the pending set
+                bool hide = IsOurLobby(lobby);   // decided before the handlers below retire a lobby from the pending set
 
                 if (msg->m_iCallback == k_iLobbyEnter) {
                     auto* le = reinterpret_cast<LobbyEnter_t*>(msg->m_pubParam);
+                    if (lobby == g_hideEnter.load()) { g_hideEnter.store(0); hide = true; }
+                    else if (!hide && le->m_EChatRoomEnterResponse == 1) NoteGameLobby(lobby);
                     OnEnteredLobby(le->m_ulSteamIDLobby, le->m_EChatRoomEnterResponse);
                 } else if (msg->m_iCallback == k_iLobbyDataUpdate) {
                     auto* u = reinterpret_cast<LobbyDataUpdate_t*>(msg->m_pubParam);
@@ -535,6 +578,7 @@ namespace SteamRelay {
                 & Res("SteamAPI_ISteamMatchmaking_CreateLobby", pCreateLobby)
                 & Res("SteamAPI_ISteamMatchmaking_RequestLobbyList", pRequestLobbyList)
                 & Res("SteamAPI_ISteamMatchmaking_JoinLobby", pJoinLobby)
+                & Res("SteamAPI_ISteamMatchmaking_LeaveLobby", pLeaveLobby)
                 & Res("SteamAPI_ISteamMatchmaking_RequestLobbyData", pRequestLobbyData)
                 & Res("SteamAPI_ISteamMatchmaking_SetLobbyData", pSetLobbyData)
                 & Res("SteamAPI_ISteamMatchmaking_GetLobbyData", pGetLobbyData)
@@ -592,19 +636,30 @@ namespace SteamRelay {
         return g_pendingListCall.load() != 0;
     }
 
-    // The resulting LobbyEnter is hidden from the game (see hkGetNextCallback).
+    // The resulting LobbyEnters are hidden from the game (see hkGetNextCallback).
     void JoinHostLobby(SteamId host) {
         if (!g_inited.load() || !pJoinLobby) return;
         uint64_t lobby = 0;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             auto it = g_hostLobby.find(host);
-            if (it == g_hostLobby.end() || g_joinedHostLobby.load() == it->second) return;
+            if (it == g_hostLobby.end()) return;
             lobby = it->second;
         }
-        g_joinedHostLobby.store(lobby);
-        pJoinLobby(g_matchmaking, lobby);
-        PayloadLog::Write("SteamRelay: joining host lobby " + std::to_string(lobby) + " (host " + std::to_string(host) + ") for relay authorization");
+        if (g_joinedHostLobby.exchange(lobby) != lobby) {
+            pJoinLobby(g_matchmaking, lobby);
+            PayloadLog::Write("SteamRelay: joining host lobby " + std::to_string(lobby) + " (host " + std::to_string(host) + ") for relay authorization");
+        }
+        JoinGameLobby(host, lobby);
+    }
+
+    void LeaveHostLobby(SteamId host) {
+        uint64_t lobby = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_lobbyForGameHost == host) lobby = std::exchange(g_lobbyForGame, 0);
+        }
+        if (lobby) pLeaveLobby(g_matchmaking, lobby);
     }
 
     bool Send(SteamId peer, const uint8_t* data, size_t len, bool reliable) {

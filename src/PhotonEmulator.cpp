@@ -537,6 +537,8 @@ namespace {
         if (s.tunnel) {
             Tunnel(s.host, FClose, s.tunnel, {}, {});
             g_tunnels.erase(s.tunnel);
+            if (std::none_of(g_sessions.begin(), g_sessions.end(), [&](const auto& e) { return &e.second != &s && e.second.tunnel && e.second.host == s.host; }))
+                SteamRelay::LeaveHostLobby(s.host);
         }
         std::erase_if(g_pending, [&](const Pending& p) { return p.socket == s.socket; });
         s.peer    = 0;
@@ -816,6 +818,7 @@ namespace PhotonEmulator {
             if (key.first == machine) DropRemote(key.first, key.second);
         }
         g_clock.erase(machine);
+        SteamRelay::LeaveHostLobby(machine);
         for (auto& [_, s] : g_sessions) {
             if (!s.tunnel || s.host != machine) continue;
             Queue(s, PhotonEnet::Disconnect, 0xff, {}).reserved = 2;   // DisconnectByServerTimeout

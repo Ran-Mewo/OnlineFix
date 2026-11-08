@@ -44,9 +44,12 @@ namespace SteamRelay {
     // Browse the registry (every other host of this game, worldwide). Async: onRegistry fires as listings arrive. False if it couldn't start.
     bool RequestRegistry();
 
-    // Co-join a host's registry lobby so Steam authorizes the relay session between the two accounts (a session to a stranger with no shared lobby
-    // times out). Idempotent.
+    // Co-join a host's registry lobby so Steam authorizes the relay session between the two accounts (a session to a stranger with no shared Steam lobby times out).
+    // Also joins the host game's Steam lobby, so friends can join through this player. Idempotent.
     void JoinHostLobby(SteamId host);
+
+    // Leave the host game's Steam lobby that JoinHostLobby joined.
+    void LeaveHostLobby(SteamId host);
 
     // Send one message to a peer. Reliable messages arrive in order; unreliable ones may be dropped or reordered.
     bool Send(SteamId peer, const uint8_t* data, size_t len, bool reliable);
