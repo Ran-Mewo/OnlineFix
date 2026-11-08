@@ -1,6 +1,6 @@
 # OnlineFix
 
-A companion DLL for [OpenSteamTool](https://github.com/OpenSteam001/OpenSteamTool) that fixes online play for games whose matchmaking runs outside Steam.
+A companion DLL for [OpenSteamTool](https://github.com/Ran-Mewo/OpenSteamTool) that fixes online play for games whose matchmaking runs outside Steam.
 
 Games that matchmake through Steam lobbies only need OpenSteamTool's `-onlinefix`. OnlineFix covers the rest: OpenSteamTool loads it into the game through `[[inject]]`, and it picks the fix for each backend from what the game's modules export, so it works across engine and SDK versions.
 
@@ -14,6 +14,18 @@ Games that matchmake through Steam lobbies only need OpenSteamTool's `-onlinefix
 It also tells OpenSteamTool which AppId the game should report, through the `OpenSteamTool_AppIdStrategy_<pid>` shared memory block: the real one for EOS, whose ticket auth needs it, and 480 for Photon.
 
 Notes on the Photon protocol the emulator speaks are in [research/photon](research/photon/).
+
+## Install
+1. Open PowerShell and run:
+   ```powershell
+   irm https://raw.githubusercontent.com/Ran-Mewo/scripts/refs/heads/main/opensteam-install.ps1 | iex
+   ```
+   It closes Steam and installs OpenSteamTool, OnlineFix, Millennium and the LuaTools plugin.
+2. To download a game, open its Steam store page, click **Add via LuaTools** at the top, then download it from your library.
+3. To play online, add `-onlinefix` to the game's launch options.
+
+> [!NOTE]
+> If Windows Defender gets in the way (unlikely), add your Steam folder (`C:\Program Files (x86)\Steam`) to its exclusions and temporarily turn off real-time protection.
 
 ## Build
 
