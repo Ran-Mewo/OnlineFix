@@ -18,7 +18,7 @@ namespace Hook {
     bool Attach(std::initializer_list<Pair> hooks);
     bool Detach(std::initializer_list<Pair> hooks);
 
-    // Same, over a runtime-built set (NativeNet decides which stacks to hook at call time).
+    // Same, over a runtime-built set when the number of hooks is only known at call time.
     bool Attach(const Pair* hooks, size_t count);
 
 } // namespace Hook

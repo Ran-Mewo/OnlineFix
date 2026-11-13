@@ -9,7 +9,7 @@ Games that matchmake through Steam lobbies only need OpenSteamTool's `-onlinefix
 | **EOS** | Logs in to EOS Connect with an anonymous Device ID | Backrooms: Escape Together |
 | **Photon** | Runs the Photon server inside the game. The room's host serves it and joiners reach the host over the Steam relay, so there's no Photon Cloud or port forwarding | R.E.P.O, Content Warning |
 | **PlayFab** (Unity/Mono) | Reroutes `PlayFabClientAPI.LoginWithSteam` to `LoginWithCustomID`, keyed on the Steam ID | Not yet |
-| **PlayFab** (Unreal/native) | Rewrites the same login request at the HTTP layer (WinHTTP, WinINet, libcurl) | Not yet |
+| **PlayFab** (Unreal/native) | Reroutes the same login at the TLS layer, under the game's statically-linked OpenSSL, so it works with whatever HTTP stack the game ships | Grounded 2 |
 
 It also tells OpenSteamTool which AppId the game should report, through the `OpenSteamTool_AppIdStrategy_<pid>` shared memory block: the real one for EOS, whose ticket auth needs it, and 480 for Photon.
 

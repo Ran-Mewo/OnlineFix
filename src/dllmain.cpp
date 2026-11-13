@@ -2,18 +2,17 @@
 // to its fix as its runtime/SDK appears — recognised by what a module EXPORTS, not its file name, so renamed or newer-versioned DLLs still match:
 //   • exports mono_get_root_domain → MonoBridge → PlayFab/Photon (managed)
 //   • exports EOS_Initialize       → EosBridge  (native EOS hooks)
-//   • exports WinHttp*/HttpOpen*/curl → NativeNet → PlayFab (REST rewrite)
 //   • exports il2cpp_init          → logged, deferred (no managed backend)
 //   • exports SteamAPI_RunCallbacks → SteamApi, which runs whatever waits on Steam
 // Each backend installs the moment its module loads — at startup or later — so one DLL covers every supported game and any load order.
 
 #include "EosBridge.h"
 #include "MonoBridge.h"
-#include "NativeNet.h"
 #include "PlayFabBridge.h"
 #include "PhotonBridge.h"
 #include "SteamApi.h"
 #include "SteamEnv.h"
+#include "TlsIntercept.h"
 #include "Pe.h"
 #include "PayloadLog.h"
 
@@ -36,18 +35,11 @@ namespace {
     constexpr ULONG LDR_LOADED = 1;
 
     // The runtimes we fix, each identified by a signature export.
-    enum Backend { Mono, Eos, Http, Il2cpp, Steam, BackendCount };
-
-    bool IsHttp(HMODULE m) {
-        return Pe::HasExport(m, "WinHttpOpenRequest")   // WinHTTP
-            || Pe::HasExport(m, "HttpOpenRequestW")     // WinINet
-            || Pe::HasExport(m, "curl_easy_setopt");    // libcurl
-    }
+    enum Backend { Mono, Eos, Il2cpp, Steam, BackendCount };
 
     Backend Classify(HMODULE m) {
         if (Pe::HasExport(m, "mono_get_root_domain")) return Mono;
         if (Pe::HasExport(m, "EOS_Initialize"))       return Eos;
-        if (IsHttp(m))                                return Http;
         if (Pe::HasExport(m, "il2cpp_init"))          return Il2cpp;
         if (Pe::HasExport(m, "SteamAPI_RunCallbacks")) return Steam;   // in every SDK; SteamAPI_Init is inline in newer ones
         return BackendCount;
@@ -81,9 +73,6 @@ namespace {
             if (due & (1u << Steam))
                 SteamApi::OnLoaded();
 
-            if (due & (1u << Http))
-                NativeNet::AttemptHooks();   // idempotent; hooks whatever HTTP stacks are now present
-
             if (due & (1u << Il2cpp)) {
                 static std::atomic_flag warned = ATOMIC_FLAG_INIT;
                 if (!warned.test_and_set())
@@ -98,15 +87,13 @@ namespace {
         if (g_work) SetEvent(g_work);
     }
 
-    // Loader-lock-safe: classify the module by its exports, record it, and signal the worker. HTTP re-posts every time (a later winhttp/
-    // wininet/curl must still be hooked); the single-runtime backends post only on first sighting.
+    // Loader-lock-safe: classify the module by its exports, record it, and signal the worker. Each backend posts only on its first sighting.
     void RouteModule(HMODULE mod) {
         switch (Classify(mod)) {
         case Mono:   if (!g_mod[Mono].exchange(mod))   Post(Mono);   break;
         case Eos:    if (!g_mod[Eos].exchange(mod))    Post(Eos);    break;
         case Il2cpp: if (!g_mod[Il2cpp].exchange(mod)) Post(Il2cpp); break;
         case Steam:  if (!g_mod[Steam].exchange(mod))  Post(Steam);  break;
-        case Http:   g_mod[Http].store(mod);           Post(Http);   break;
         default:     break;
         }
     }
@@ -140,9 +127,7 @@ namespace {
         g_work = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset: a sighting during a drain is retained
         if (HANDLE t = CreateThread(nullptr, 0, InstallWorker, nullptr, 0, nullptr)) CloseHandle(t);
 
-        // Register the native PlayFab REST rewriter and hook any HTTP stack already present. It only ever matches the PlayFab login
-        // endpoint, so it's harmless on games that don't use PlayFab and composes with the managed path (idempotent on the custom body).
-        PlayFabBridge::InstallNative();
+        TlsIntercept::Install();   // PlayFab login reroute at the TLS layer: static-OpenSSL SSL_write rewrite + Schannel capture, below any HTTP client
 
         SubscribeToDllLoads();
         ScanLoadedModules();

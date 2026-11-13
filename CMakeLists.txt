@@ -45,7 +45,7 @@ add_library(OnlineFix SHARED
     src/dllmain.cpp
     src/EosBridge.cpp
     src/MonoBridge.cpp
-    src/NativeNet.cpp
+    src/TlsIntercept.cpp
     src/PlayFabBridge.cpp
     src/PhotonBridge.cpp
     src/PhotonProtocol.cpp

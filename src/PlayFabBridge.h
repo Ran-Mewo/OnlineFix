@@ -6,7 +6,7 @@
 //  still gets a stable, distinct PlayFab account and a real session token.
 //
 //    • Unity/Mono: detour PlayFabClientAPI.LoginWithSteam and call LoginWithCustomID instead (via MonoBridge).
-//    • Unreal/native: rewrite the LoginWithSteam REST request into a LoginWithCustomID request on the wire (via NativeNet).
+//    • Native (static OpenSSL etc.): rerouted at the TLS layer instead — see TlsIntercept.
 // ─────────────────────────────────────────────────────────────────
 
 namespace PlayFabBridge {
@@ -14,8 +14,5 @@ namespace PlayFabBridge {
     // Unity/Mono path. Subscribes to Mono's assembly-load event and hooks PlayFabClientAPI.LoginWithSteam as soon as the PlayFab assembly is present.
     // Event-driven; no polling. Call once MonoBridge::Ready().
     void InstallMono();
-
-    // Unreal/native path. Registers a NativeNet rewriter for the PlayFab login endpoint. Call once NativeNet is installed. Installs once.
-    void InstallNative();
 
 } // namespace PlayFabBridge

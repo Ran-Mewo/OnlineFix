@@ -1,6 +1,5 @@
 #include "PlayFabBridge.h"
 #include "MonoBridge.h"
-#include "NativeNet.h"
 #include "SteamApi.h"
 #include "PayloadLog.h"
 
@@ -12,7 +11,6 @@
 
 namespace {
     std::atomic_bool g_monoInstalled{false};
-    std::atomic_bool g_nativeInstalled{false};
 
     std::string SteamIdString() {
         uint64_t id = SteamApi::LocalSteamId();
@@ -57,59 +55,6 @@ namespace {
         MonoBridge::Invoke(g_loginCustomIdMethod, nullptr, args);
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    //  Unreal / native path
-    // ─────────────────────────────────────────────────────────────────
-    //
-    //  PlayFab REST: POST https://<title>.playfabapi.com/Client/LoginWithSteam {"SteamTicket":"...","TitleId":"...","CreateAccount":...}
-    //  We reroute it to /Client/LoginWithCustomID {"CustomId":"<steamid>","CreateAccount":true,"TitleId":"..."}, and the real PlayFab server
-    //  then issues a genuine session, so the game gets a valid SessionTicket/EntityToken with no fakery.
-
-    constexpr char kSteamPath[]  = "/Client/LoginWithSteam";
-    constexpr char kCustomPath[] = "/Client/LoginWithCustomID";
-
-    // Pull "TitleId":"VALUE" out of the original JSON so the rewritten body keeps targeting the same title. Minimal scan — no JSON lib.
-    std::string ExtractJsonString(const std::string& json, const char* key) {
-        std::string needle = std::string("\"") + key + "\"";
-        size_t k = json.find(needle);
-        if (k == std::string::npos) return {};
-        size_t colon = json.find(':', k + needle.size());
-        if (colon == std::string::npos) return {};
-        size_t q1 = json.find('"', colon + 1);
-        if (q1 == std::string::npos) return {};
-        size_t q2 = json.find('"', q1 + 1);
-        if (q2 == std::string::npos) return {};
-        return json.substr(q1 + 1, q2 - q1 - 1);
-    }
-
-    bool PlayFabRewriter(NativeNet::HttpRequest& req) {
-        // Match the login path (open call) or a body already on the custom path (send call after we rerouted). Idempotent: once the path is the
-        // custom one we only fix the body.
-        const bool onSteamPath  = req.path.find(kSteamPath)  != std::string::npos;
-        const bool onCustomPath = req.path.find(kCustomPath) != std::string::npos;
-        if (!onSteamPath && !onCustomPath) return false;
-
-        bool changed = false;
-
-        // Reroute path at the open call (empty body).
-        if (onSteamPath) {
-            size_t pos = req.path.find(kSteamPath);
-            req.path.replace(pos, std::strlen(kSteamPath), kCustomPath);
-            changed = true;
-        }
-
-        // Rewrite the body when present (send call).
-        if (!req.body.empty()) {
-            std::string title = ExtractJsonString(req.body, "TitleId");
-            std::string id = SteamIdString();
-            std::string body = "{\"CustomId\":\"" + id + "\",\"CreateAccount\":true";
-            if (!title.empty()) body += ",\"TitleId\":\"" + title + "\"";
-            body += "}";
-            if (req.body != body) { req.body = body; changed = true; }
-        }
-        return changed;
-    }
-
     // Fired by Mono on every assembly load (and once at registration). Installs the LoginWithSteam hook as soon as the PlayFab assembly is present.
     // Idempotent: latches g_monoInstalled on success so repeated events are no-ops. No polling.
     void OnAssembly() {
@@ -141,14 +86,6 @@ namespace PlayFabBridge {
         // Event-driven: react to the PlayFab assembly loading. OnAssembly fires immediately for already-loaded assemblies and on each future load, so
         // there is no polling.
         MonoBridge::OnAssemblyLoaded(OnAssembly);
-    }
-
-    void InstallNative() {
-        bool expected = false;
-        if (!g_nativeInstalled.compare_exchange_strong(expected, true)) return;
-        NativeNet::AddRewriter(PlayFabRewriter);
-        NativeNet::Install();
-        PayloadLog::Write("PlayFab[Native]: REST rewriter registered");
     }
 
 } // namespace PlayFabBridge
